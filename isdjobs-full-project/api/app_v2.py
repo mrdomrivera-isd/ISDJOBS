@@ -1,25 +1,18 @@
 from __future__ import annotations
-import os, re, time
+import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Optional: geocoding & distance
-try:
-    from geopy.geocoders import Nominatim
-    from geopy.distance import geodesic
-except Exception:
-    Nominatim = None
-    geodesic = None
+# -------------------- FastAPI app --------------------
 
-app = FastAPI(title="ISD Jobs API", version="2.0.0", docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(title="ISD Jobs API (Workday Only)", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
 
-# Enable CORS for pilot testing
+# CORS (open for pilot; tighten later if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -31,136 +24,124 @@ app.add_middleware(
 # -------------------- Models --------------------
 
 class SearchParams(BaseModel):
-    zip: str = "20147"
-    radius: float = 50
-    include_remote: bool = True
-    require_clearance: bool = True
-    clearances: List[str] = Field(default_factory=list)
-    salary_min: float = 0
-    salary_max: float = 1000000
-    pay_types: List[str] = Field(default_factory=lambda: ["hourly", "salary"])
+    # Keep minimal fields for pilot; add more later when filters come back
     keywords: List[str] = Field(default_factory=list)
-    companies_config: Dict[str, List[str]] = Field(default_factory=lambda: {"lever": [], "greenhouse": []})
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    companies_config: Dict[str, List[str]] = Field(
+        default_factory=lambda: {"workday": []}
+    )
+    # Optional pagination tuning per request (defaults are safe)
+    wd_limit: int = 100               # items per page (Workday allows 20–100 typically)
+    wd_max_pages: int = 3             # stop after this many pages per tenant
 
 class BookmarkIn(BaseModel):
     url: str
     status: str = ""
     notes: str = ""
 
-# -------------------- Utility Functions --------------------
+# -------------------- Workday Fetcher --------------------
 
-TOKEN_RE = re.compile(r"^[a-z0-9-]+$")
-CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 120  # seconds
+def fetch_workday(
+    tenant: str,
+    site: str,
+    wd_host_hint: Optional[str] = None,
+    search_text: str = "",
+    page_limit: int = 100,
+    max_pages: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch jobs from a Workday tenant/site using the CXS endpoint via POST.
+    Tries the provided wd_host_hint (e.g., 'wd5') first; if not provided,
+    tries a small set of common hosts.
 
-def valid_board_token(t: str) -> bool:
-    return bool(t) and bool(TOKEN_RE.match(t))
+    Returns a normalized list of job dicts.
+    """
+    # Host order: hint first, then common hosts
+    host_candidates = [wd_host_hint] if wd_host_hint else []
+    for h in ["wd5", "wd1", "wd3", "wd2"]:
+        if h not in host_candidates:
+            host_candidates.append(h)
 
-def norm(s: Optional[str]) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    headers = {
+        "User-Agent": "isdjobs/1.0",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "appliedFacets": {},         # add filters (facets) later as needed
+        "limit": max(1, min(page_limit, 100)),
+        "offset": 0,
+        "searchText": search_text or ""
+    }
 
-def strip_html(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    try:
-        return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-    except Exception:
-        return norm(text)
+    results: List[Dict[str, Any]] = []
 
-# -------------------- ATS Fetchers --------------------
+    for host in [h for h in host_candidates if h]:
+        base = f"https://{tenant}.{host}.myworkdayjobs.com"
+        url = f"{base}/wday/cxs/{tenant}/{site}/jobs"
 
-def fetch_lever(company: str) -> List[Dict[str, Any]]:
-    if not valid_board_token(company):
-        return []
-    cache_key = f"lever:{company}"
-    now = time.time()
-    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
-        return CACHE[cache_key]["data"]
+        try:
+            offset = 0
+            page = 0
+            while page < max_pages:
+                payload["offset"] = offset
+                r = requests.post(url, json=payload, headers=headers, timeout=25)
+                if r.status_code != 200:
+                    # Try next host if the very first request fails; otherwise break this host
+                    if page == 0:
+                        break
+                    else:
+                        # partial success on earlier pages; stop paging this host
+                        break
 
-    url = f"https://api.lever.co/v0/postings/{company}?mode=json"
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return []
+                data = r.json()
+                postings = data.get("jobPostings") or []
+                if not postings:
+                    break
 
-    jobs: List[Dict[str, Any]] = []
-    for item in data:
-        title = norm(item.get("text"))
-        location = norm((item.get("categories") or {}).get("location"))
-        department = norm((item.get("categories") or {}).get("team"))
-        url_post = item.get("hostedUrl") or item.get("applyUrl") or ""
-        desc_html = item.get("description") or ""
+                for job in postings:
+                    title = job.get("title") or ""
+                    locs = job.get("locations") or []
+                    location = ", ".join(locs) if isinstance(locs, list) else (locs or "")
+                    external_path = job.get("externalPath") or ""
+                    posted_on = job.get("postedOn") or ""
 
-        jobs.append({
-            "source": "lever",
-            "company": company,
-            "title": title,
-            "location": location,
-            "remote": "remote" in (location or "").lower(),
-            "url": url_post,
-            "department": department or "",
-            "content_html": desc_html if isinstance(desc_html, str) else "",
-        })
+                    # Public view URL for the job (deep link)
+                    view_url = f"{base}/{site}/job/{external_path}" if external_path else ""
 
-    CACHE[cache_key] = {"ts": now, "data": jobs}
-    return jobs
+                    results.append({
+                        "source": "workday",
+                        "company": tenant,
+                        "title": title,
+                        "location": location,
+                        "remote": "remote" in (location or "").lower(),
+                        "url": view_url,
+                        "department": job.get("jobFamily") or "",
+                        "work_type": "",            # can be derived from facets in a later pass
+                        "pay_type": "",
+                        "comp_annual_min": None,
+                        "comp_annual_max": None,
+                        "posted_at": posted_on,
+                        "content_html": "",         # detail endpoint can be added later
+                    })
 
-def fetch_greenhouse(company: str) -> List[Dict[str, Any]]:
-    if not valid_board_token(company):
-        return []
-    cache_key = f"greenhouse:{company}"
-    now = time.time()
-    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
-        return CACHE[cache_key]["data"]
+                # advance pagination
+                got = len(postings)
+                offset += got
+                page += 1
 
-    url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true"
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return []
+                # if we got fewer than the requested limit, likely last page
+                if got < payload["limit"]:
+                    break
 
-    jobs: List[Dict[str, Any]] = []
-    for item in data.get("jobs", []):
-        title = norm(item.get("title"))
-        location = norm((item.get("location") or {}).get("name"))
-        dep = ", ".join(d.get("name") for d in (item.get("departments") or []) if d.get("name"))
-        url_post = item.get("absolute_url") or ""
-        content_html = item.get("content") or ""
+            # If we captured any results for this host, don't try others
+            if results:
+                return results
 
-        jobs.append({
-            "source": "greenhouse",
-            "company": company,
-            "title": title,
-            "location": location,
-            "remote": "remote" in (location or "").lower(),
-            "url": url_post,
-            "department": dep or "",
-            "content_html": content_html,
-        })
+        except Exception:
+            # Try next host candidate
+            continue
 
-    CACHE[cache_key] = {"ts": now, "data": jobs}
-    return jobs
-
-def collect_jobs(companies: Dict[str, List[str]], keywords: List[str]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for c in companies.get("lever", []):
-        out.extend(fetch_lever(c))
-    for c in companies.get("greenhouse", []):
-        out.extend(fetch_greenhouse(c))
-    # De-duplicate by URL
-    seen, uniq = set(), []
-    for j in out:
-        u = j.get("url")
-        if u and u not in seen:
-            seen.add(u)
-            uniq.append(j)
-    return uniq
+    return results
 
 # -------------------- Routes --------------------
 
@@ -170,25 +151,59 @@ def health() -> Dict[str, Any]:
 
 @app.post("/search")
 def search(params: SearchParams) -> Dict[str, Any]:
-    companies = params.companies_config or {"lever": [], "greenhouse": []}
-    companies = {
-        "lever": [c for c in companies.get("lever", []) if valid_board_token(c)],
-        "greenhouse": [c for c in companies.get("greenhouse", []) if valid_board_token(c)],
-    }
+    """
+    Workday-only search for pilot:
+    - Read companies_config.workday entries in form 'tenant|site|hostOptional'
+    - For each, call the CXS endpoint via POST
+    - Aggregate and return raw results (no filtering yet)
+    """
+    workday_specs = params.companies_config.get("workday", []) if params.companies_config else []
+    results: List[Dict[str, Any]] = []
 
-    # Fetch jobs without applying filters yet
-    all_jobs = collect_jobs(companies, params.keywords)
+    # Turn keyword list into a single Workday search string
+    search_text = " ".join(params.keywords or []).strip()
+
+    for spec in workday_specs:
+        try:
+            parts = [p.strip() for p in spec.split("|")]
+            if not parts or len(parts) < 1:
+                continue
+            tenant = parts[0]
+            site = parts[1] if len(parts) > 1 and parts[1] else "External"
+            wd_host = parts[2] if len(parts) > 2 and parts[2] else None
+
+            jobs = fetch_workday(
+                tenant=tenant,
+                site=site,
+                wd_host_hint=wd_host,
+                search_text=search_text,
+                page_limit=params.wd_limit,
+                max_pages=params.wd_max_pages,
+            )
+            results.extend(jobs)
+        except Exception:
+            # Skip any tenant that errors out
+            continue
+
+    # De-duplicate by URL
+    seen: set[str] = set()
+    uniq: List[Dict[str, Any]] = []
+    for j in results:
+        u = j.get("url") or ""
+        if u and u not in seen:
+            seen.add(u)
+            uniq.append(j)
 
     return {
-        "results": all_jobs,
+        "results": uniq,
         "meta": {
-            "count": len(all_jobs),
-            "zip": params.zip,
-            "radius": params.radius
-        }
+            "count": len(uniq),
+            "workday_tenants": workday_specs,
+            "keywords": params.keywords,
+        },
     }
 
-# -------------------- Bookmarks --------------------
+# -------------------- Bookmarks (simple in-memory pilot) --------------------
 
 BOOKMARKS: Dict[str, Dict[str, Any]] = {}
 
@@ -202,7 +217,7 @@ def add_bookmark(bm: BookmarkIn):
         "url": bm.url,
         "status": bm.status,
         "notes": bm.notes,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.utcnow().isoformat(),
     }
     return BOOKMARKS[bm.url]
 
