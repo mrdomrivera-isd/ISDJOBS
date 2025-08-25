@@ -1,19 +1,25 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+# ... (rest of imports)
 
-app = FastAPI(title="ISD Jobs API", version="1.0.0")
+app = FastAPI(
+    title="ISD Jobs API",
+    version="1.0.0",
+    docs_url="/docs",      # ensure Swagger is ON
+    redoc_url="/redoc"     # optional alt docs
+)
 
-# Permissive CORS for now (you can tighten later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # OK for pilot; tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "API root. See /health and /docs."}
 
 class SearchParams(BaseModel):
     zip: str = "20147"
