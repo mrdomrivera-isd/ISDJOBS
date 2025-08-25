@@ -292,10 +292,13 @@ def inside_radius(origin: Tuple[float,float], location_name: str, radius: float)
 def apply_filters(jobs: List[Dict[str, Any]], params: SearchParams) -> List[Dict[str, Any]]:
     # origin
     origin = None
-    if params.latitude is not None and params.longitude is not None:
-        origin = (params.latitude, params.longitude)
-    else:
-        origin = geocode_zip(params.zip)
+   geo_available = (geodesic is not None) and (Nominatim is not None)
+if params.latitude is not None and params.longitude is not None:
+    origin = (params.latitude, params.longitude)
+elif geo_available:
+    origin = geocode_zip(params.zip)
+
+skip_radius = (not geo_available) or (origin is None)
 
     kept: List[Dict[str, Any]] = []
     for j in jobs:
@@ -310,17 +313,15 @@ def apply_filters(jobs: List[Dict[str, Any]], params: SearchParams) -> List[Dict
         ):
             continue
 
-        # remote / radius
-        if params.include_remote and j.get("remote"):
-            pass  # allow
-        else:
-            if origin and j.get("location"):
-                if not inside_radius(origin, j["location"], params.radius):
-                    continue
-            else:
-                # If we have no origin or no location info, drop unless remote is allowed & set
-                if not j.get("remote"):
-                    continue
+        # remote / radius (robust)
+if params.include_remote and j.get("remote"):
+    pass  # allow if remote
+elif skip_radius:
+    pass  # cannot geocode → keep job
+else:
+    loc = j.get("location")
+    if not loc or not inside_radius(origin, loc, params.radius):
+        continue
 
         # salary overlap
         lo = j.get("comp_annual_min")
