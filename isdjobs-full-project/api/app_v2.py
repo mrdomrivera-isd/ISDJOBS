@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-# ... (rest of imports)
+from pydantic import BaseModel, Field   # ✅ make sure this line is here
+from typing import List, Optional, Dict, Any
+from datetime import datetime
 
 app = FastAPI(
     title="ISD Jobs API",
