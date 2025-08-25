@@ -352,29 +352,22 @@ def health() -> Dict[str, Any]:
 @app.post("/search")
 def search(params: SearchParams) -> Dict[str, Any]:
     companies = params.companies_config or {"lever": [], "greenhouse": []}
-    # drop any invalid tokens
     companies = {
         "lever": [c for c in companies.get("lever", []) if valid_board_token(c)],
         "greenhouse": [c for c in companies.get("greenhouse", []) if valid_board_token(c)],
     }
+
+    # Fetch jobs but skip all filtering for now
     all_jobs = collect_jobs(companies, params.keywords)
-    filtered = apply_filters(all_jobs, params)
-    # shape response for UI
-    rows = [{
-        "source": j.get("source",""),
-        "company": j.get("company",""),
-        "title": j.get("title",""),
-        "location": j.get("location",""),
-        "remote": bool(j.get("remote")),
-        "department": j.get("department",""),
-        "work_type": j.get("work_type",""),
-        "pay_type": j.get("pay_type",""),
-        "comp_annual_min": j.get("comp_annual_min"),
-        "comp_annual_max": j.get("comp_annual_max"),
-        "posted_at": j.get("posted_at",""),
-        "url": j.get("url",""),
-    } for j in filtered]
-    return {"results": rows, "meta": {"count": len(rows), "zip": params.zip, "radius": params.radius}}
+
+    return {
+        "results": all_jobs,
+        "meta": {
+            "count": len(all_jobs),
+            "zip": params.zip,
+            "radius": params.radius
+        }
+    }
 
 # ----- Bookmarks (in-memory for pilot) -----
 BOOKMARKS: Dict[str, Dict[str, Any]] = {}
