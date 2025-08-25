@@ -131,7 +131,7 @@ export default function App(){
         latitude: lat,
         longitude: lon,
         keywords: DEFAULT_KEYWORDS,
-        companies_config: { "lever": [], "greenhouse": ["andurilindustries","palantir","shieldai","hawkeye360","twosixtechnologies"] }
+        companies_config: { lever: [], greenhouse: [] }
       };
       const res = await fetch(apiBase.replace(/\/$/,"") + "/search", {
         method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body)
