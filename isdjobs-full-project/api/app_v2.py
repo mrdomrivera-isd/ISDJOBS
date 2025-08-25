@@ -8,11 +8,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# -------------------- FastAPI app --------------------
+# -------------------- FastAPI App --------------------
 
-app = FastAPI(title="ISD Jobs API (Workday Only)", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(
+    title="ISD Jobs API (Workday Only)",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
-# CORS (open for pilot; tighten later if needed)
+# Enable CORS for front-end
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -24,14 +29,12 @@ app.add_middleware(
 # -------------------- Models --------------------
 
 class SearchParams(BaseModel):
-    # Keep minimal fields for pilot; add more later when filters come back
     keywords: List[str] = Field(default_factory=list)
     companies_config: Dict[str, List[str]] = Field(
         default_factory=lambda: {"workday": []}
     )
-    # Optional pagination tuning per request (defaults are safe)
-    wd_limit: int = 100               # items per page (Workday allows 20–100 typically)
-    wd_max_pages: int = 3             # stop after this many pages per tenant
+    wd_limit: int = 50
+    wd_max_pages: int = 2
 
 class BookmarkIn(BaseModel):
     url: str
@@ -45,17 +48,13 @@ def fetch_workday(
     site: str,
     wd_host_hint: Optional[str] = None,
     search_text: str = "",
-    page_limit: int = 100,
-    max_pages: int = 3,
+    page_limit: int = 50,
+    max_pages: int = 2,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch jobs from a Workday tenant/site using the CXS endpoint via POST.
-    Tries the provided wd_host_hint (e.g., 'wd5') first; if not provided,
-    tries a small set of common hosts.
-
-    Returns a normalized list of job dicts.
+    Fetch jobs from a Workday CXS endpoint via POST.
+    Example tenant/site: 'leidos|External|wd5'
     """
-    # Host order: hint first, then common hosts
     host_candidates = [wd_host_hint] if wd_host_hint else []
     for h in ["wd5", "wd1", "wd3", "wd2"]:
         if h not in host_candidates:
@@ -63,11 +62,12 @@ def fetch_workday(
 
     headers = {
         "User-Agent": "isdjobs/1.0",
-        "Accept": "application/json",
+        "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     payload = {
-        "appliedFacets": {},         # add filters (facets) later as needed
+        "appliedFacets": {},
         "limit": max(1, min(page_limit, 100)),
         "offset": 0,
         "searchText": search_text or ""
@@ -75,7 +75,7 @@ def fetch_workday(
 
     results: List[Dict[str, Any]] = []
 
-    for host in [h for h in host_candidates if h]:
+    for host in host_candidates:
         base = f"https://{tenant}.{host}.myworkdayjobs.com"
         url = f"{base}/wday/cxs/{tenant}/{site}/jobs"
 
@@ -86,12 +86,7 @@ def fetch_workday(
                 payload["offset"] = offset
                 r = requests.post(url, json=payload, headers=headers, timeout=25)
                 if r.status_code != 200:
-                    # Try next host if the very first request fails; otherwise break this host
-                    if page == 0:
-                        break
-                    else:
-                        # partial success on earlier pages; stop paging this host
-                        break
+                    break
 
                 data = r.json()
                 postings = data.get("jobPostings") or []
@@ -104,8 +99,6 @@ def fetch_workday(
                     location = ", ".join(locs) if isinstance(locs, list) else (locs or "")
                     external_path = job.get("externalPath") or ""
                     posted_on = job.get("postedOn") or ""
-
-                    # Public view URL for the job (deep link)
                     view_url = f"{base}/{site}/job/{external_path}" if external_path else ""
 
                     results.append({
@@ -116,29 +109,23 @@ def fetch_workday(
                         "remote": "remote" in (location or "").lower(),
                         "url": view_url,
                         "department": job.get("jobFamily") or "",
-                        "work_type": "",            # can be derived from facets in a later pass
+                        "work_type": "",
                         "pay_type": "",
                         "comp_annual_min": None,
                         "comp_annual_max": None,
                         "posted_at": posted_on,
-                        "content_html": "",         # detail endpoint can be added later
+                        "content_html": "",
                     })
 
-                # advance pagination
                 got = len(postings)
                 offset += got
                 page += 1
-
-                # if we got fewer than the requested limit, likely last page
                 if got < payload["limit"]:
                     break
 
-            # If we captured any results for this host, don't try others
             if results:
-                return results
-
+                break  # stop if this host worked
         except Exception:
-            # Try next host candidate
             continue
 
     return results
@@ -152,15 +139,12 @@ def health() -> Dict[str, Any]:
 @app.post("/search")
 def search(params: SearchParams) -> Dict[str, Any]:
     """
-    Workday-only search for pilot:
-    - Read companies_config.workday entries in form 'tenant|site|hostOptional'
-    - For each, call the CXS endpoint via POST
-    - Aggregate and return raw results (no filtering yet)
+    Workday-only search for pilot testing.
     """
     workday_specs = params.companies_config.get("workday", []) if params.companies_config else []
     results: List[Dict[str, Any]] = []
 
-    # Turn keyword list into a single Workday search string
+    # Turn keywords into a single string
     search_text = " ".join(params.keywords or []).strip()
 
     for spec in workday_specs:
@@ -169,8 +153,8 @@ def search(params: SearchParams) -> Dict[str, Any]:
             if not parts or len(parts) < 1:
                 continue
             tenant = parts[0]
-            site = parts[1] if len(parts) > 1 and parts[1] else "External"
-            wd_host = parts[2] if len(parts) > 2 and parts[2] else None
+            site = parts[1] if len(parts) > 1 else "External"
+            wd_host = parts[2] if len(parts) > 2 else None
 
             jobs = fetch_workday(
                 tenant=tenant,
@@ -182,10 +166,9 @@ def search(params: SearchParams) -> Dict[str, Any]:
             )
             results.extend(jobs)
         except Exception:
-            # Skip any tenant that errors out
             continue
 
-    # De-duplicate by URL
+    # Deduplicate by URL
     seen: set[str] = set()
     uniq: List[Dict[str, Any]] = []
     for j in results:
@@ -203,7 +186,7 @@ def search(params: SearchParams) -> Dict[str, Any]:
         },
     }
 
-# -------------------- Bookmarks (simple in-memory pilot) --------------------
+# -------------------- Bookmarks --------------------
 
 BOOKMARKS: Dict[str, Dict[str, Any]] = {}
 
