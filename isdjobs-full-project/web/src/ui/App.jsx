@@ -115,7 +115,10 @@ export default function App(){
     );
   };
 
-  const runSearch = async () => {
+  const runSearch = async (companies_config: {
+  lever: [],
+  greenhouse: ["anduril-industries"]   // start with ONE known-good token
+} => {
     if (!apiBase) { setError("API Base is empty. Set it above or define VITE_API_BASE in Render."); return; }
     setLoading(true); setError("");
     try {
